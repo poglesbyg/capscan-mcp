@@ -67,13 +67,15 @@ cargo install capscan
   `Cargo.lock`. This can take tens of seconds to minutes on large
   lockfiles -- it resolves and fetches real crate sources via `cargo`.
   ```bash
-  cargo capscan audit --lockfile ./Cargo.lock
+  cargo capscan audit --lockfile ./Cargo.lock --min-severity medium
   ```
-  The MCP `audit` tool additionally accepts `min_severity`
-  (`"low"`/`"medium"`/`"high"`) to skip up-to-date dependencies in the
-  response -- use it, especially on large lockfiles, so you're not
-  wading through noise to find the handful of findings that matter. (The
-  CLI doesn't have this flag yet; summarize the output yourself instead.)
+  Pass `min_severity`/`--min-severity` (`"low"`/`"medium"`/`"high"`, both
+  the MCP tool and the CLI support it) to skip up-to-date dependencies in
+  the result -- use it, especially on large lockfiles, so you're not
+  wading through noise to find the handful of findings that matter. It
+  only filters what's shown/returned; the CLI's exit code still reflects
+  the true worst severity across every dependency regardless of the
+  filter, so it's safe to use in a CI gate.
   The MCP tool also emits progress notifications during the run if your
   client requested a `progressToken` -- surface those to the user on
   long audits instead of going silent.
