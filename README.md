@@ -10,10 +10,11 @@ trusting a `Cargo.toml` edit blind.
 ## Install
 
 ```
-cargo install --path .
+cargo install capscan-mcp
 ```
 
-This builds the `capscan-mcp` binary, which speaks MCP over stdio.
+or, from a checkout of this repo: `cargo install --path .`. Either way this
+builds the `capscan-mcp` binary, which speaks MCP over stdio.
 
 ## Register it with an MCP client
 
@@ -34,6 +35,26 @@ Claude Code CLI:
 ```
 claude mcp add capscan -- capscan-mcp
 ```
+
+## Claude Code skill
+
+Registering the server gets you the tools; [`skills/capscan-audit`](skills/capscan-audit)
+gets an agent to actually *reach for them* -- before bumping a dependency
+version, adding a new one, or running `cargo update`, instead of only when
+you happen to ask. Install it once:
+
+```bash
+# available in every project on this machine
+cp -r skills/capscan-audit ~/.claude/skills/
+
+# or scoped to just this project
+mkdir -p .claude/skills && cp -r skills/capscan-audit .claude/skills/
+```
+
+It works even without the MCP server connected -- it falls back to the
+`cargo capscan` CLI (`cargo install capscan` if it isn't already) -- but
+prefers the MCP tools when they're available so results come back
+structured rather than as text to re-parse.
 
 ## Tools
 
