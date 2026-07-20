@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "MCP server exposing capscan's crate capability scanning (scan/diff/audit) as tools for AI coding agents."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/poglesbyg/capscan-mcp"
+readme = "README.md"
+keywords = ["mcp", "cargo", "security", "agent", "audit"]
+categories = ["development-tools", "development-tools::cargo-plugins"]
 
 [dependencies]
 capscan = "0.1"
