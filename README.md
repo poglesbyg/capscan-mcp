@@ -41,7 +41,7 @@ claude mcp add capscan -- capscan-mcp
 |---|---|---|
 | `scan` | `name`, `version` | Capability signals for one published crate version. |
 | `diff` | `name`, `old_version`, `new_version` | What capabilities/dependencies a version bump would add or remove. Use this before recommending or applying one. |
-| `audit` | `lockfile_path` (absolute path) | Checks every crates.io dependency in a `Cargo.lock` against its latest published version; can take tens of seconds on large lockfiles since it fetches real crate sources via `cargo`. |
+| `audit` | `lockfile_path` (absolute path), `min_severity` (optional: `"low"`/`"medium"`/`"high"`) | Checks every crates.io dependency in a `Cargo.lock` against its latest published version; can take tens of seconds to minutes on large lockfiles since it fetches real crate sources via `cargo`. Pass `min_severity` to only get back dependencies that found something at or above that severity, instead of every up-to-date one too -- a 117-dependency lockfile is a 28KB response otherwise, almost all of it "nothing to report." |
 
 All three return the same JSON shapes as `capscan`'s own `--json` CLI output
 (`CrateReport`, `Diff`, `Vec<AuditEntry>`), rendered as text content in the
@@ -77,6 +77,10 @@ entire raw-unsafe surface from `wasi` itself in favor of the new `wasip2`
 dependency. Exactly the kind of thing that's invisible in a normal
 `cargo update` diff and easy for an agent to surface with one tool call.
 
+Filtered to `min_severity: "medium"`, that same audit drops the 109
+up-to-date dependencies entirely and returns only the handful actually
+worth an agent's attention.
+
 ## How it's built
 
 A thin wrapper: three `#[tool]`-annotated methods on a
@@ -90,14 +94,18 @@ crate is just protocol glue.
 ## Tests
 
 ```
-cargo test              # protocol-level tests against the real compiled binary, no network
-cargo test -- --ignored # also calls `diff` for real against anyhow on crates.io
+cargo test              # unit tests (min_severity filtering) + protocol tests, no network
+cargo test -- --ignored # also calls `diff` and `audit` for real against crates.io
 ```
 
 `tests/protocol.rs` spawns the actual compiled `capscan-mcp` binary and talks
 real JSON-RPC to it over stdio (initialize, `tools/list`, `tools/call`) —
 the same wire format any MCP client uses — rather than reaching into rmcp's
-internal client API.
+internal client API. Its `call_server` helper deliberately keeps stdin open
+until every expected response has arrived before closing it, per the
+stdin-lifecycle note above; the ignored `audit` test is the same
+~30-90s-long-call scenario that caught that bug in the first place, now
+covered as a regression test instead of a one-off manual finding.
 
 ## License
 

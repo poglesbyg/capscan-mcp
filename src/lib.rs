@@ -19,6 +19,35 @@ fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpErro
     Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
+fn parse_severity(s: &str) -> Result<capscan::Severity, McpError> {
+    match s.to_ascii_lowercase().as_str() {
+        "low" => Ok(capscan::Severity::Low),
+        "medium" => Ok(capscan::Severity::Medium),
+        "high" => Ok(capscan::Severity::High),
+        other => Err(McpError::invalid_params(
+            format!("invalid min_severity '{other}' (expected 'low', 'medium', or 'high')"),
+            None,
+        )),
+    }
+}
+
+/// Keep only entries whose worst new capability is at least `min_severity`
+/// -- entries with no diff at all (already at latest) never pass a filter,
+/// since there's nothing to report for them. `None` means no filtering.
+fn filter_by_min_severity(
+    entries: Vec<capscan::AuditEntry>,
+    min_severity: Option<&str>,
+) -> Result<Vec<capscan::AuditEntry>, McpError> {
+    let Some(min_severity) = min_severity else {
+        return Ok(entries);
+    };
+    let threshold = parse_severity(min_severity)?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| e.worst_severity().is_some_and(|sev| sev >= threshold))
+        .collect())
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ScanRequest {
     #[schemars(description = "Crate name on crates.io, e.g. \"anyhow\"")]
@@ -41,6 +70,11 @@ pub struct DiffRequest {
 pub struct AuditRequest {
     #[schemars(description = "Absolute path to the Cargo.lock file to audit")]
     pub lockfile_path: String,
+    #[schemars(
+        description = "Only include dependencies whose worst new capability is at least this severity: \"low\", \"medium\", or \"high\". Omit to include every dependency, including ones already at latest."
+    )]
+    #[serde(default)]
+    pub min_severity: Option<String>,
 }
 
 #[derive(Clone)]
@@ -112,11 +146,14 @@ impl CapscanTools {
     }
 
     #[tool(
-        description = "Audit every crates.io dependency in a Cargo.lock against its latest published version, and report which ones would gain new capabilities if updated. Can take tens of seconds on large lockfiles -- it resolves and fetches real crate sources via cargo."
+        description = "Audit every crates.io dependency in a Cargo.lock against its latest published version, and report which ones would gain new capabilities if updated. Can take tens of seconds to minutes on large lockfiles -- it resolves and fetches real crate sources via cargo. Pass min_severity (\"low\"/\"medium\"/\"high\") to only get back dependencies that actually found something, instead of every up-to-date dependency too."
     )]
     async fn audit(
         &self,
-        Parameters(AuditRequest { lockfile_path }): Parameters<AuditRequest>,
+        Parameters(AuditRequest {
+            lockfile_path,
+            min_severity,
+        }): Parameters<AuditRequest>,
     ) -> Result<CallToolResult, McpError> {
         let entries =
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<capscan::AuditEntry>> {
@@ -125,6 +162,8 @@ impl CapscanTools {
             .await
             .map_err(to_mcp_err)?
             .map_err(to_mcp_err)?;
+
+        let entries = filter_by_min_severity(entries, min_severity.as_deref())?;
 
         json_result(&entries)
     }
@@ -144,5 +183,75 @@ impl ServerHandler for CapscanTools {
                  inspect a single version on its own."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capscan::{AuditEntry, Diff, Severity, Signal, SignalKind};
+
+    fn entry(name: &str, worst: Option<Severity>) -> AuditEntry {
+        let diff = worst.map(|sev| {
+            let kind = match sev {
+                Severity::Low => SignalKind::EnvRead,
+                Severity::Medium => SignalKind::UnsafeBlock,
+                Severity::High => SignalKind::UnsafeFn,
+            };
+            Diff {
+                old: (name.to_string(), "1.0.0".to_string()),
+                new: (name.to_string(), "2.0.0".to_string()),
+                added: vec![Signal {
+                    kind,
+                    file: "src/lib.rs".to_string(),
+                    line: 1,
+                    detail: "x".to_string(),
+                }],
+                removed: vec![],
+                added_dependencies: vec![],
+                removed_dependencies: vec![],
+            }
+        });
+        AuditEntry {
+            name: name.to_string(),
+            locked_version: "1.0.0".to_string(),
+            latest_version: if worst.is_some() { "2.0.0" } else { "1.0.0" }.to_string(),
+            diff,
+        }
+    }
+
+    #[test]
+    fn min_severity_filters_out_low_and_up_to_date() {
+        let entries = vec![
+            entry("up-to-date", None),
+            entry("low-only", Some(Severity::Low)),
+            entry("medium-hit", Some(Severity::Medium)),
+            entry("high-hit", Some(Severity::High)),
+        ];
+
+        let filtered = filter_by_min_severity(entries, Some("medium")).unwrap();
+        let names: Vec<&str> = filtered.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["medium-hit", "high-hit"]);
+    }
+
+    #[test]
+    fn no_min_severity_returns_everything_unfiltered() {
+        let entries = vec![entry("a", None), entry("b", Some(Severity::High))];
+        let filtered = filter_by_min_severity(entries.clone(), None).unwrap();
+        assert_eq!(filtered.len(), entries.len());
+    }
+
+    #[test]
+    fn min_severity_is_case_insensitive() {
+        let entries = vec![entry("a", Some(Severity::High))];
+        let filtered = filter_by_min_severity(entries, Some("HIGH")).unwrap();
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn invalid_min_severity_is_rejected_with_a_useful_message() {
+        let entries = vec![entry("a", Some(Severity::High))];
+        let err = filter_by_min_severity(entries, Some("critical")).unwrap_err();
+        assert!(err.message.contains("critical"));
     }
 }
