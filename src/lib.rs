@@ -3,12 +3,17 @@
 //! access, build scripts) before recommending or applying a dependency
 //! change, instead of trusting a version bump blind.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{
+    schemars, tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
+};
+use tokio::task::JoinSet;
 
 fn to_mcp_err(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
@@ -46,6 +51,27 @@ fn filter_by_min_severity(
         .into_iter()
         .filter(|e| e.worst_severity().is_some_and(|sev| sev >= threshold))
         .collect())
+}
+
+/// Send an MCP progress notification if (and only if) the caller opted in
+/// by including a progressToken with its request -- most clients don't, so
+/// this has to be a no-op rather than an error in that case. Best-effort:
+/// a client that stopped listening for notifications shouldn't fail the
+/// whole audit over it.
+async fn send_progress(
+    ctx: &RequestContext<RoleServer>,
+    token: Option<&ProgressToken>,
+    progress: f64,
+    total: f64,
+    message: impl Into<String>,
+) {
+    let Some(token) = token else {
+        return;
+    };
+    let param = ProgressNotificationParam::new(token.clone(), progress)
+        .with_total(total)
+        .with_message(message.into());
+    let _ = ctx.peer.notify_progress(param).await;
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -146,7 +172,7 @@ impl CapscanTools {
     }
 
     #[tool(
-        description = "Audit every crates.io dependency in a Cargo.lock against its latest published version, and report which ones would gain new capabilities if updated. Can take tens of seconds to minutes on large lockfiles -- it resolves and fetches real crate sources via cargo. Pass min_severity (\"low\"/\"medium\"/\"high\") to only get back dependencies that actually found something, instead of every up-to-date dependency too."
+        description = "Audit every crates.io dependency in a Cargo.lock against its latest published version, and report which ones would gain new capabilities if updated. Can take tens of seconds to minutes on large lockfiles -- it resolves and fetches real crate sources via cargo. Sends MCP progress notifications as it works (resolving latest versions, then diffing whichever ones are behind) if the caller's request includes a progressToken. Pass min_severity (\"low\"/\"medium\"/\"high\") to only get back dependencies that actually found something, instead of every up-to-date dependency too."
     )]
     async fn audit(
         &self,
@@ -154,14 +180,124 @@ impl CapscanTools {
             lockfile_path,
             min_severity,
         }): Parameters<AuditRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let entries =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<capscan::AuditEntry>> {
-                capscan::audit_project(Path::new(&lockfile_path))
+        let token = ctx.meta.get_progress_token();
+
+        // Reimplemented here (rather than calling capscan::audit_project as
+        // one opaque blocking call) specifically so progress can be reported
+        // between steps -- audit_project's own parallelism is internal
+        // std::thread::scope, with no hook to observe as it runs.
+        let deps = {
+            let path = lockfile_path.clone();
+            tokio::task::spawn_blocking(move || capscan::parse_lockfile(Path::new(&path)))
+                .await
+                .map_err(to_mcp_err)?
+                .map_err(to_mcp_err)?
+        };
+
+        let mut unique_names: Vec<String> = deps.iter().map(|d| d.name.clone()).collect();
+        unique_names.sort_unstable();
+        unique_names.dedup();
+        let total_names = unique_names.len();
+
+        // Phase 1: resolve the latest published version of every dependency.
+        // Capped concurrency, not one task per name: an early attempt at
+        // this fired all of them at once and the progress notifications
+        // showed why that's wrong -- every lookup piles onto cargo's own
+        // registry-index lock simultaneously, so progress sat at 1-2/116
+        // for ~47s and then jumped to 116/116 in under 2s once the lock
+        // contention cleared. Same cap and rationale as capscan's own
+        // MAX_VERSION_LOOKUP_WORKERS.
+        const MAX_CONCURRENT_LOOKUPS: usize = 16;
+        let mut pending_names = unique_names.into_iter();
+        let mut lookups = JoinSet::new();
+        for name in pending_names.by_ref().take(MAX_CONCURRENT_LOOKUPS) {
+            lookups.spawn_blocking(move || (name.clone(), capscan::latest_version(&name)));
+        }
+
+        let mut latest_by_name: HashMap<String, String> = HashMap::new();
+        let mut resolved = 0usize;
+        while let Some(joined) = lookups.join_next().await {
+            resolved += 1;
+            if let Ok((name, Ok(Some(version)))) = joined {
+                latest_by_name.insert(name, version);
+            }
+            if let Some(next_name) = pending_names.next() {
+                lookups.spawn_blocking(move || {
+                    (next_name.clone(), capscan::latest_version(&next_name))
+                });
+            }
+            send_progress(
+                &ctx,
+                token.as_ref(),
+                resolved as f64,
+                total_names as f64,
+                format!("resolved latest versions: {resolved}/{total_names}"),
+            )
+            .await;
+        }
+
+        // Phase 2: diff whichever dependencies are actually behind.
+        let to_diff: Vec<capscan::LockedDependency> = deps
+            .iter()
+            .filter(|dep| {
+                latest_by_name
+                    .get(&dep.name)
+                    .is_some_and(|latest| *latest != dep.version)
+            })
+            .cloned()
+            .collect();
+        let total_to_diff = to_diff.len();
+
+        let mut diff_by_name: HashMap<String, capscan::Diff> = HashMap::new();
+        for (i, dep) in to_diff.into_iter().enumerate() {
+            let new_version = latest_by_name
+                .get(&dep.name)
+                .expect("to_diff only contains names present in latest_by_name")
+                .clone();
+            let name = dep.name.clone();
+            let old_version = dep.version.clone();
+
+            let diff = tokio::task::spawn_blocking(move || -> anyhow::Result<capscan::Diff> {
+                let old_path = capscan::locate_or_fetch(&name, &old_version)?;
+                let new_path = capscan::locate_or_fetch(&name, &new_version)?;
+                let old_report = capscan::scan_dir(&name, &old_version, &old_path)?;
+                let new_report = capscan::scan_dir(&name, &new_version, &new_path)?;
+                Ok(capscan::diff_reports(&old_report, &new_report))
             })
             .await
             .map_err(to_mcp_err)?
             .map_err(to_mcp_err)?;
+
+            diff_by_name.insert(dep.name.clone(), diff);
+
+            send_progress(
+                &ctx,
+                token.as_ref(),
+                (i + 1) as f64,
+                total_to_diff as f64,
+                format!(
+                    "diffed out-of-date dependencies: {}/{total_to_diff} ({})",
+                    i + 1,
+                    dep.name
+                ),
+            )
+            .await;
+        }
+
+        let entries: Vec<capscan::AuditEntry> = deps
+            .into_iter()
+            .filter_map(|dep| {
+                let latest_version = latest_by_name.get(&dep.name)?.clone();
+                Some(capscan::AuditEntry {
+                    diff: diff_by_name.get(&dep.name).cloned(),
+                    name: dep.name,
+                    locked_version: dep.version,
+                    latest_version,
+                })
+            })
+            .collect();
 
         let entries = filter_by_min_severity(entries, min_severity.as_deref())?;
 

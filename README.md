@@ -41,7 +41,7 @@ claude mcp add capscan -- capscan-mcp
 |---|---|---|
 | `scan` | `name`, `version` | Capability signals for one published crate version. |
 | `diff` | `name`, `old_version`, `new_version` | What capabilities/dependencies a version bump would add or remove. Use this before recommending or applying one. |
-| `audit` | `lockfile_path` (absolute path), `min_severity` (optional: `"low"`/`"medium"`/`"high"`) | Checks every crates.io dependency in a `Cargo.lock` against its latest published version; can take tens of seconds to minutes on large lockfiles since it fetches real crate sources via `cargo`. Pass `min_severity` to only get back dependencies that found something at or above that severity, instead of every up-to-date one too -- a 117-dependency lockfile is a 28KB response otherwise, almost all of it "nothing to report." |
+| `audit` | `lockfile_path` (absolute path), `min_severity` (optional: `"low"`/`"medium"`/`"high"`) | Checks every crates.io dependency in a `Cargo.lock` against its latest published version; can take tens of seconds to minutes on large lockfiles since it fetches real crate sources via `cargo`. Pass `min_severity` to only get back dependencies that found something at or above that severity, instead of every up-to-date one too -- a 117-dependency lockfile is a 28KB response otherwise, almost all of it "nothing to report." Reports MCP progress notifications as it works if your request includes a `progressToken` -- see below. |
 
 All three return the same JSON shapes as `capscan`'s own `--json` CLI output
 (`CrateReport`, `Diff`, `Vec<AuditEntry>`), rendered as text content in the
@@ -59,6 +59,39 @@ tool result.
 > is stdio-transport behavior, not something `capscan-mcp` controls, but it's
 > sharp enough to catch someone writing their own client, so it's called out
 > here explicitly.
+
+## Progress notifications
+
+`audit`'s ~47s runtime is a long time for a client to sit in silence, so it
+reports real MCP progress notifications as it works -- if you include a
+`progressToken` in your request's `_meta`, you'll get one notification per
+dependency as its latest version resolves, then one per out-of-date
+dependency as it gets diffed, e.g.:
+
+```
+notifications/progress  1/116  resolved latest versions: 1/116
+notifications/progress  2/116  resolved latest versions: 2/116
+...
+notifications/progress  1/8    diffed out-of-date dependencies: 1/8 (r-efi)
+...
+```
+
+If your request has no `progressToken`, `audit` behaves exactly as before
+-- silent until the final result. This is opt-in, not a behavior change.
+
+The concurrency behind this was tuned by watching it happen, not by
+guessing. The first version fired one lookup per dependency at once (116
+concurrent `spawn_blocking` tasks for this repo's own lockfile) and the
+progress notifications immediately showed why that's wrong: progress sat
+at 1-2/116 for about 47 seconds while every lookup piled onto cargo's own
+registry-index lock simultaneously, then jumped to 116/116 in under 2
+seconds once the contention cleared -- a curve that looks stalled for
+almost the entire call. Capping concurrency at 16 (same cap and rationale
+as `capscan`'s own `MAX_VERSION_LOOKUP_WORKERS`) turned that into a steady
+cadence of ~16 completions every 5-6 seconds and cut total time from
+~49s to ~42s in the same test. Bounded concurrency isn't just gentler on
+cargo's lock, it's the difference between a progress bar that looks broken
+and one that looks like it's actually doing something.
 
 ## Real-world example
 
@@ -83,13 +116,20 @@ worth an agent's attention.
 
 ## How it's built
 
-A thin wrapper: three `#[tool]`-annotated methods on a
-[`rmcp`](https://crates.io/crates/rmcp) `ServerHandler`, each calling straight
-into the `capscan` library crate (`locate_or_fetch`, `scan_dir`,
-`diff_reports`, `audit_project`) inside `tokio::task::spawn_blocking`, since
-those do real subprocess/filesystem I/O and shouldn't block the async
-runtime. All the actual scanning/diffing logic lives in `capscan` — this
-crate is just protocol glue.
+Three `#[tool]`-annotated methods on a [`rmcp`](https://crates.io/crates/rmcp)
+`ServerHandler`. `scan` and `diff` call straight into the `capscan` library
+crate (`locate_or_fetch`, `scan_dir`, `diff_reports`) inside
+`tokio::task::spawn_blocking`, since those do real subprocess/filesystem I/O
+and shouldn't block the async runtime. `audit` reimplements that same
+orchestration itself -- using capscan's individual public functions
+(`parse_lockfile`, `latest_version`, `locate_or_fetch`, `scan_dir`,
+`diff_reports`) instead of calling capscan's own all-in-one
+`audit_project` -- specifically so it has a point to hook progress
+notifications into; `audit_project`'s parallelism is internal
+`std::thread::scope` with no way to observe it from outside as it runs.
+All the actual scanning/diffing logic still lives in `capscan` either way —
+this crate is protocol glue plus, for `audit`, its own progress-aware
+scheduling on top.
 
 ## Tests
 
