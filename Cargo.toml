@@ -1,6 +1,6 @@
 [package]
 name = "capscan-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "MCP server exposing capscan's crate capability scanning (scan/diff/audit) as tools for AI coding agents."
 license = "MIT OR Apache-2.0"
@@ -19,3 +19,8 @@ anyhow = "1"
 
 [dev-dependencies]
 rmcp = { version = "2.2", features = ["client"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
