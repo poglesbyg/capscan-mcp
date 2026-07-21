@@ -9,6 +9,18 @@ trusting a `Cargo.toml` edit blind.
 
 ## Install
 
+Prebuilt binary, no Rust toolchain needed -- macOS, Linux, and Windows,
+from the [latest release](https://github.com/poglesbyg/capscan-mcp/releases/latest):
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/poglesbyg/capscan-mcp/releases/latest/download/capscan-mcp-installer.sh | sh
+```
+
+(PowerShell on Windows: see the install command on the
+[release page](https://github.com/poglesbyg/capscan-mcp/releases/latest).)
+
+Or build from source:
+
 ```
 cargo install capscan-mcp
 ```
